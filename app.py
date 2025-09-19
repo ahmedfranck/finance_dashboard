@@ -526,4 +526,5 @@ with tab_board:
 """)
 
 # Footer
-st.caption("Fictional data. Built with Streamlit, Plotly, and Pandas to demonstrate a data-driven decision dashboard for a fintech context.")
+st.caption("Fictional data. Made by Ahmed Gbadamassi.")
+
