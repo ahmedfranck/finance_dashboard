@@ -6,7 +6,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
@@ -48,13 +47,14 @@ def make_data(seed=42, months=18, n_customers=12000):
     # Customers
     cust = pd.DataFrame({
         "customer_id": np.arange(1, n_customers+1),
-        "region": rng.choice(regions, n_customomers:=n_customers, p=[0.25, 0.20, 0.18, 0.25, 0.12]),
-        "segment": rng.choice(segments, n_customomers, p=[0.45, 0.25, 0.10, 0.20]),
-        "industry": rng.choice(industries, n_customomers),
-        "acquired_date": rng.choice(pd.date_range(start, today - pd.Timedelta(days=30), freq="D"), n_customomers),
-        "sales_rep": rng.choice(reps, n_customomers),
-        "product_primary": rng.choice(products, n_customomers, p=[0.35, 0.15, 0.18, 0.20, 0.12]),
+        "region": rng.choice(regions, n_customers, p=[0.25, 0.20, 0.18, 0.25, 0.12]),
+        "segment": rng.choice(segments, n_customers, p=[0.45, 0.25, 0.10, 0.20]),
+        "industry": rng.choice(industries, n_customers),
+        "acquired_date": rng.choice(pd.date_range(start, today - pd.Timedelta(days=30), freq="D"), n_customers),
+        "sales_rep": rng.choice(reps, n_customers),
+        "product_primary": rng.choice(products, n_customers, p=[0.35, 0.15, 0.18, 0.20, 0.12]),
     })
+
     # Plan assignment influenced by segment
     seg_to_plan_probs = {
         "Consumer": [0.75, 0.20, 0.04, 0.01],
@@ -108,7 +108,7 @@ def make_data(seed=42, months=18, n_customers=12000):
     txns = []
     for m in months_index:
         month_days = pd.date_range(m, m + relativedelta(months=1) - timedelta(days=1), freq="D")
-        # >>> FIX: include sales_rep in active_ids so it flows into txns
+        # include sales_rep so it flows into txns
         active_ids = subs.loc[
             (subs["month"] == m) & (subs["active"] == 1),
             ["customer_id", "product_primary", "plan", "region", "segment", "sales_rep"]
@@ -150,7 +150,8 @@ def make_data(seed=42, months=18, n_customers=12000):
                  "txn_count","gross_revenue","refunds","fraud_loss","net_revenue"]
     )
     for c in ["gross_revenue","refunds","fraud_loss","net_revenue"]:
-        txns[c] = txns[c].astype(float).round(2) if not txns.empty else txns[c]
+        if not txns.empty:
+            txns[c] = txns[c].astype(float).round(2)
 
     # Funnel (fictional)
     funnel = []
@@ -188,14 +189,6 @@ subs_summary = subs.groupby("month", as_index=False).agg(
     mrr=("mrr","sum")
 ) if not subs.empty else pd.DataFrame(columns=["month","active_accounts","mrr"])
 
-revenue_monthly = (txns.groupby("month", as_index=False).agg(
-    gross=("gross_revenue","sum"),
-    net=("net_revenue","sum"),
-    refunds=("refunds","sum"),
-    fraud=("fraud_loss","sum"),
-    txn_count=("txn_count","sum")
-) if not txns.empty else pd.DataFrame(columns=["month","gross","net","refunds","fraud","txn_count"]))
-
 # -----------------------------
 # Sidebar: Global filters
 # -----------------------------
@@ -229,6 +222,10 @@ if not txns.empty:
     txns_f = txns.loc[mask_txn]
 else:
     txns_f = txns.copy()
+
+# >>> bulletproof guard: ensure sales_rep exists in txns_f for Sales tab
+if not txns_f.empty and "sales_rep" not in txns_f.columns:
+    txns_f = txns_f.merge(cust[["customer_id", "sales_rep"]], on="customer_id", how="left")
 
 mask_subs = (
     subs["region"].isin(region_sel) &
@@ -335,21 +332,20 @@ with tab_sales:
         st.info("No funnel data for the selected period.")
         col1, col2 = st.columns(2)
 
-    # Rep leaderboard (safe even if empty)
+    # Rep leaderboard (safe even if data was missing initially)
     if not txns_f.empty and "sales_rep" in txns_f.columns:
         rep_rev = txns_f.groupby("sales_rep", as_index=False)["net_revenue"].sum().sort_values("net_revenue", ascending=False).head(20)
         col2.plotly_chart(px.bar(rep_rev, x="sales_rep", y="net_revenue", title="Rep leaderboard (Net Revenue)"), use_container_width=True)
     else:
         col2.info("No rep revenue available in selection.")
 
-    # Region x product heatmap
+    # Region x product heatmap + proxy scatter
     col3, col4 = st.columns(2)
     if not txns_f.empty:
         heat = txns_f.groupby(["region","product_primary"], as_index=False)["net_revenue"].sum()
         pt = heat.pivot(index="region", columns="product_primary", values="net_revenue").fillna(0)
         col3.plotly_chart(px.imshow(pt, text_auto=".2s", aspect="auto", title="Revenue Heatmap: Region x Product"), use_container_width=True)
 
-        # Simple scatter (no statsmodels required)
         growth = subs_f.groupby("month", as_index=False)["active"].sum() if not subs_f.empty else pd.DataFrame(columns=["month","active"])
         proxy = (fsel.merge(growth, on="month", how="left")) if not fsel.empty else pd.DataFrame(columns=["month","wins","active"])
         if not proxy.empty:
@@ -400,16 +396,17 @@ with tab_risk:
         c1.metric("Fraud rate (avg)", f"{fr['fraud_rate_pct'].mean():.3f}%")
         c2.metric("Fraud loss (sum)", f"${fr['fraud'].sum():,.0f}")
 
-        st.plotly_chart(px.bar(fr, x="month", y="fraud_rate_pct", title="Monthly fraud rate %"), use_container_width=True)
+        fig_df = px.bar(fr, x="month", y="fraud_rate_pct", title="Monthly fraud rate %")
+        st.plotly_chart(fig_df, use_container_width=True)
 
         daily_fraud = txns_f.groupby("date", as_index=False)["fraud_loss"].sum()
         thr = daily_fraud["fraud_loss"].mean() + 3*daily_fraud["fraud_loss"].std()
         alerts = daily_fraud[daily_fraud["fraud_loss"] > thr]
 
         col1, col2 = st.columns(2)
-        fig_df = px.line(daily_fraud, x="date", y="fraud_loss", title="Daily fraud loss (3-sigma threshold shown)")
-        fig_df.add_hline(y=float(thr))
-        col1.plotly_chart(fig_df, use_container_width=True)
+        fig_line = px.line(daily_fraud, x="date", y="fraud_loss", title="Daily fraud loss (3-sigma threshold shown)")
+        fig_line.add_hline(y=float(thr))
+        col1.plotly_chart(fig_line, use_container_width=True)
         col2.dataframe(alerts.rename(columns={"fraud_loss":"fraud_loss_usd"}), use_container_width=True, height=320)
 
         cb = chargebacks.merge(fr[["month","fraud_rate_pct"]], on="month", how="left")
@@ -446,8 +443,6 @@ with tab_finance:
         col2.plotly_chart(px.line(act_by_month, x="month", y="churn_rate_pct", title="Churn rate over time"), use_container_width=True)
     else:
         st.info("Not enough subscription data to compute ARPU/LTV.")
-        arpu = pd.DataFrame()
-        act_by_month = pd.DataFrame()
 
     # P&L lite: net revenue minus CAC proxy
     if not txns.empty and not funnel.empty:
