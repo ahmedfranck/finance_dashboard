@@ -26,7 +26,7 @@ st.set_page_config(
 def make_data(seed=42, months=18, n_customers=12000):
     """
     Generate fictional fintech data:
-    - Customers, subscriptions, monthly recurring revenue, transactions, refunds, fraud, chargebacks
+    - Customers, subscriptions, MRR, transactions, refunds, fraud, chargebacks
     - Regions, products, plans, sales reps
     """
     rng = np.random.default_rng(seed)
@@ -54,7 +54,6 @@ def make_data(seed=42, months=18, n_customers=12000):
         "sales_rep": rng.choice(reps, n_customers),
         "product_primary": rng.choice(products, n_customers, p=[0.35, 0.15, 0.18, 0.20, 0.12]),
     })
-
     # Plan assignment influenced by segment
     seg_to_plan_probs = {
         "Consumer": [0.75, 0.20, 0.04, 0.01],
@@ -79,7 +78,7 @@ def make_data(seed=42, months=18, n_customers=12000):
     months_index = pd.period_range(start=start.to_period('M'), end=today.to_period('M'), freq="M").to_timestamp()
 
     # Subscription status over time
-    subs = []
+    subs_rows = []
     for _, row in cust.iterrows():
         start_date = row["acquired_date"].replace(day=1)
         active = True
@@ -88,7 +87,7 @@ def make_data(seed=42, months=18, n_customers=12000):
                 continue
             if active and m > start_date and rng.random() < base_churn_monthly[row["plan"]]:
                 active = False
-            subs.append({
+            subs_rows.append({
                 "customer_id": row["customer_id"],
                 "month": m,
                 "active": int(active),
@@ -96,16 +95,15 @@ def make_data(seed=42, months=18, n_customers=12000):
                 "region": row["region"],
                 "segment": row["segment"],
                 "product_primary": row["product_primary"],
-                "sales_rep": row["sales_rep"],
-                # small uplift for POS-heavy accounts
-                "mrr": plan_mrr[row["plan"]] * (1 + 0.15 * (row["product_primary"] in ["POS"]))
+                "sales_rep": row["sales_rep"],  # keep for downstream
+                "mrr": plan_mrr[row["plan"]] * (1 + 0.15 * (row["product_primary"] == "POS"))
             })
-    subs = pd.DataFrame(subs)
+    subs = pd.DataFrame(subs_rows)
     subs.loc[subs["active"] == 1, "mrr"] *= (1 + 0.004 * (subs["month"] - subs["month"].min()).dt.days / 30)
     subs["mrr"] = subs["mrr"].round(2)
 
     # Transactions table (aggregate daily)
-    txns = []
+    txns_chunks = []
     for m in months_index:
         month_days = pd.date_range(m, m + relativedelta(months=1) - timedelta(days=1), freq="D")
         # include sales_rep so it flows into txns
@@ -116,7 +114,6 @@ def make_data(seed=42, months=18, n_customers=12000):
         if active_ids.empty:
             continue
 
-        # baseline per customer per day
         base = 0.2 + 1.2 * active_ids["segment"].map({"Consumer":1.0, "SME":1.2, "Mid Market":1.5, "Enterprise":1.8}).values
         base *= active_ids["product_primary"].map(prod_intensity).values
         base *= active_ids["plan"].map(plan_mult).values
@@ -143,32 +140,34 @@ def make_data(seed=42, months=18, n_customers=12000):
             chunk["refunds"] = refunds
             chunk["fraud_loss"] = fraud
             chunk["net_revenue"] = net
-            txns.append(chunk)
+            txns_chunks.append(chunk)
 
-    txns = pd.concat(txns, ignore_index=True) if txns else pd.DataFrame(
-        columns=["customer_id","product_primary","plan","region","segment","sales_rep","date",
-                 "txn_count","gross_revenue","refunds","fraud_loss","net_revenue"]
-    )
-    for c in ["gross_revenue","refunds","fraud_loss","net_revenue"]:
-        if not txns.empty:
+    if txns_chunks:
+        txns = pd.concat(txns_chunks, ignore_index=True)
+        for c in ["gross_revenue","refunds","fraud_loss","net_revenue"]:
             txns[c] = txns[c].astype(float).round(2)
+        txns["month"] = txns["date"].values.astype("datetime64[M]")
+    else:
+        txns = pd.DataFrame(
+            columns=["customer_id","product_primary","plan","region","segment","sales_rep","date",
+                     "txn_count","gross_revenue","refunds","fraud_loss","net_revenue","month"]
+        )
 
     # Funnel (fictional)
-    funnel = []
+    funnel_rows = []
     for m in months_index:
         leads = int(1200 + 600*np.sin((m.month/12)*2*np.pi) + rng.integers(0,200))
         mql = int(leads * (0.45 + 0.1*rng.random()))
         sql = int(mql * (0.55 + 0.1*rng.random()))
         demos = int(sql * (0.62 + 0.08*rng.random()))
         wins = int(demos * (0.34 + 0.07*rng.random()))
-        funnel.append({"month": m, "leads": leads, "mql": mql, "sql": sql, "demos": demos, "wins": wins})
-    funnel = pd.DataFrame(funnel)
+        funnel_rows.append({"month": m, "leads": leads, "mql": mql, "sql": sql, "demos": demos, "wins": wins})
+    funnel = pd.DataFrame(funnel_rows)
 
     # Chargebacks monthly (subset of fraud)
     if not txns.empty:
         chargebacks = (
-            txns.assign(month=lambda x: x["date"].values.astype("datetime64[M]"))
-                .groupby("month", as_index=False)[["fraud_loss"]].sum()
+            txns.groupby("month", as_index=False)[["fraud_loss"]].sum()
         )
         chargebacks["chargebacks"] = (chargebacks["fraud_loss"] * 0.45).round(2)
     else:
@@ -181,14 +180,6 @@ def make_data(seed=42, months=18, n_customers=12000):
 # -----------------------------
 cust, subs, txns, funnel, chargebacks, REGIONS, PRODUCTS, PLANS, REPS, SEGMENTS, INDUSTRIES, MIN_DATE, MAX_DATE = make_data()
 
-# Precompute helpers
-if not txns.empty:
-    txns["month"] = txns["date"].values.astype("datetime64[M]")
-subs_summary = subs.groupby("month", as_index=False).agg(
-    active_accounts=("active","sum"),
-    mrr=("mrr","sum")
-) if not subs.empty else pd.DataFrame(columns=["month","active_accounts","mrr"])
-
 # -----------------------------
 # Sidebar: Global filters
 # -----------------------------
@@ -199,35 +190,33 @@ date_range = st.sidebar.date_input(
     min_value=MIN_DATE,
     max_value=MAX_DATE
 )
-region_sel = st.sidebar.multiselect("Region", REGIONS, default=REGIONS)
+region_sel  = st.sidebar.multiselect("Region", REGIONS,   default=REGIONS)
 product_sel = st.sidebar.multiselect("Product", PRODUCTS, default=PRODUCTS)
-plan_sel = st.sidebar.multiselect("Plan", PLANS, default=PLANS)
+plan_sel    = st.sidebar.multiselect("Plan", PLANS,       default=PLANS)
 segment_sel = st.sidebar.multiselect("Segment", SEGMENTS, default=SEGMENTS)
 
 # Apply filters
-mask_cust = (
+cust_f = cust[
     cust["region"].isin(region_sel) &
     cust["plan"].isin(plan_sel) &
     cust["segment"].isin(segment_sel) &
-    (cust["acquired_date"].between(pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])))
-)
-cust_f = cust.loc[mask_cust]
+    cust["acquired_date"].between(pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1]))
+]
 
 if not txns.empty:
-    mask_txn = (
+    txns_f = txns[
         txns["region"].isin(region_sel) &
         txns["product_primary"].isin(product_sel) &
         txns["date"].between(pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1]))
-    )
-    txns_f = txns.loc[mask_txn]
+    ].copy()
 else:
     txns_f = txns.copy()
 
-# >>> bulletproof guard: ensure sales_rep exists in txns_f for Sales tab
+# --- bulletproof guard: ensure sales_rep exists in txns_f for Sales tab
 if not txns_f.empty and "sales_rep" not in txns_f.columns:
     txns_f = txns_f.merge(cust[["customer_id", "sales_rep"]], on="customer_id", how="left")
 
-mask_subs = (
+subs_f = subs[
     subs["region"].isin(region_sel) &
     subs["plan"].isin(plan_sel) &
     subs["segment"].isin(segment_sel) &
@@ -235,10 +224,9 @@ mask_subs = (
         pd.to_datetime(pd.to_datetime(date_range[0]).replace(day=1)),
         pd.to_datetime(pd.to_datetime(date_range[1]).replace(day=1))
     )
-)
-subs_f = subs.loc[mask_subs]
+].copy()
 
-# KPI helpers
+# Helpers
 def kpi_delta(curr, prev):
     if prev == 0:
         return 0.0
@@ -265,7 +253,6 @@ tab_overview, tab_sales, tab_ops, tab_risk, tab_finance, tab_customer, tab_board
 # ========== OVERVIEW ==========
 with tab_overview:
     st.subheader("Company Pulse")
-
     m_rev_all = month_agg(txns.groupby("month").agg(net=("net_revenue","sum")).reset_index()) if not txns.empty else pd.DataFrame(columns=["month","net"])
     m_rev = txns_f.groupby("month", as_index=False).agg(net=("net_revenue","sum")) if not txns_f.empty else pd.DataFrame(columns=["month","net"])
     m_accounts = subs_f.groupby("month", as_index=False).agg(active=("active","sum"), mrr=("mrr","sum")) if not subs_f.empty else pd.DataFrame(columns=["month","active","mrr"])
@@ -292,10 +279,9 @@ with tab_overview:
     c4.metric("Gross Margin Proxy", "≈ 92.5%", "+0.3 pp vs prev")
 
     if not m_rev_all.empty:
-        fig = px.area(m_rev_all, x="month", y="net", title="Company Net Revenue Trend (all regions, all products)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(px.area(m_rev_all, x="month", y="net", title="Company Net Revenue Trend (all regions, all products)"), use_container_width=True)
     else:
-        st.info("No revenue data available for the current filters.")
+        st.info("No revenue data for current filters.")
 
     col1, col2 = st.columns(2)
     if not txns_f.empty:
@@ -319,12 +305,12 @@ with tab_sales:
     if not fsel.empty:
         fsel = fsel.copy()
         fsel["win_rate"] = (fsel["wins"] / fsel["demos"].replace(0, np.nan)) * 100
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Leads (avg)", f"{int(fsel['leads'].mean()):,}")
-        c2.metric("MQL (avg)", f"{int(fsel['mql'].mean()):,}")
-        c3.metric("SQL (avg)", f"{int(fsel['sql'].mean()):,}")
-        c4.metric("Demos (avg)", f"{int(fsel['demos'].mean()):,}")
-        c5.metric("Win rate (avg)", f"{fsel['win_rate'].mean():.1f}%")
+        a, b, c, d, e = st.columns(5)
+        a.metric("Leads (avg)", f"{int(fsel['leads'].mean()):,}")
+        b.metric("MQL (avg)", f"{int(fsel['mql'].mean()):,}")
+        c.metric("SQL (avg)", f"{int(fsel['sql'].mean()):,}")
+        d.metric("Demos (avg)", f"{int(fsel['demos'].mean()):,}")
+        e.metric("Win rate (avg)", f"{fsel['win_rate'].mean():.1f}%")
 
         col1, col2 = st.columns(2)
         col1.plotly_chart(px.line(fsel, x="month", y=["leads","mql","sql","demos","wins"], title="Funnel over time"), use_container_width=True)
@@ -332,14 +318,18 @@ with tab_sales:
         st.info("No funnel data for the selected period.")
         col1, col2 = st.columns(2)
 
-    # Rep leaderboard (safe even if data was missing initially)
-    if not txns_f.empty and "sales_rep" in txns_f.columns:
-        rep_rev = txns_f.groupby("sales_rep", as_index=False)["net_revenue"].sum().sort_values("net_revenue", ascending=False).head(20)
+    # Rep leaderboard (bulletproof)
+    if not txns_f.empty:
+        if "sales_rep" not in txns_f.columns:
+            txns_f = txns_f.merge(cust[["customer_id","sales_rep"]], on="customer_id", how="left")
+        rep_rev = (txns_f.groupby("sales_rep", as_index=False)["net_revenue"]
+                          .sum()
+                          .sort_values("net_revenue", ascending=False)
+                          .head(20))
         col2.plotly_chart(px.bar(rep_rev, x="sales_rep", y="net_revenue", title="Rep leaderboard (Net Revenue)"), use_container_width=True)
     else:
         col2.info("No rep revenue available in selection.")
 
-    # Region x product heatmap + proxy scatter
     col3, col4 = st.columns(2)
     if not txns_f.empty:
         heat = txns_f.groupby(["region","product_primary"], as_index=False)["net_revenue"].sum()
@@ -369,20 +359,20 @@ with tab_ops:
         )
         daily["success_rate"] = np.where(daily["txn"]>0, 100*(1 - (daily["refunds"]+daily["fraud"])/daily["gross"].replace(0,np.nan)), np.nan)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Avg daily transactions", f"{int(daily['txn'].mean()):,}")
-        c2.metric("Transaction success rate", f"{daily['success_rate'].mean():.2f}%")
-        c3.metric("Refunds as % of gross", f"{100*daily['refunds'].sum()/daily['gross'].sum():.2f}%")
+        x, y, z = st.columns(3)
+        x.metric("Avg daily transactions", f"{int(daily['txn'].mean()):,}")
+        y.metric("Transaction success rate", f"{daily['success_rate'].mean():.2f}%")
+        z.metric("Refunds as % of gross", f"{100*daily['refunds'].sum()/daily['gross'].sum():.2f}%")
 
         st.plotly_chart(px.line(daily, x="date", y=["txn","success_rate"], title="Daily volume and success rate"), use_container_width=True)
 
-        col1, col2 = st.columns(2)
+        c1, c2 = st.columns(2)
         by_seg = txns_f.groupby("segment", as_index=False)[["txn_count","gross_revenue","refunds"]].sum()
         by_seg["refund_rate_pct"] = 100 * by_seg["refunds"] / by_seg["gross_revenue"].replace(0, np.nan)
-        col1.plotly_chart(px.bar(by_seg, x="segment", y="refund_rate_pct", title="Refund rate by Segment"), use_container_width=True)
+        c1.plotly_chart(px.bar(by_seg, x="segment", y="refund_rate_pct", title="Refund rate by Segment"), use_container_width=True)
 
         by_region_day = txns_f.groupby(["region","date"], as_index=False)["txn_count"].sum()
-        col2.plotly_chart(px.line(by_region_day, x="date", y="txn_count", color="region", title="Daily volume by region"), use_container_width=True)
+        c2.plotly_chart(px.line(by_region_day, x="date", y="txn_count", color="region", title="Daily volume by region"), use_container_width=True)
     else:
         st.info("No operational data available for the current filters.")
 
@@ -396,18 +386,17 @@ with tab_risk:
         c1.metric("Fraud rate (avg)", f"{fr['fraud_rate_pct'].mean():.3f}%")
         c2.metric("Fraud loss (sum)", f"${fr['fraud'].sum():,.0f}")
 
-        fig_df = px.bar(fr, x="month", y="fraud_rate_pct", title="Monthly fraud rate %")
-        st.plotly_chart(fig_df, use_container_width=True)
+        st.plotly_chart(px.bar(fr, x="month", y="fraud_rate_pct", title="Monthly fraud rate %"), use_container_width=True)
 
         daily_fraud = txns_f.groupby("date", as_index=False)["fraud_loss"].sum()
         thr = daily_fraud["fraud_loss"].mean() + 3*daily_fraud["fraud_loss"].std()
         alerts = daily_fraud[daily_fraud["fraud_loss"] > thr]
 
-        col1, col2 = st.columns(2)
+        d1, d2 = st.columns(2)
         fig_line = px.line(daily_fraud, x="date", y="fraud_loss", title="Daily fraud loss (3-sigma threshold shown)")
         fig_line.add_hline(y=float(thr))
-        col1.plotly_chart(fig_line, use_container_width=True)
-        col2.dataframe(alerts.rename(columns={"fraud_loss":"fraud_loss_usd"}), use_container_width=True, height=320)
+        d1.plotly_chart(fig_line, use_container_width=True)
+        d2.dataframe(alerts.rename(columns={"fraud_loss":"fraud_loss_usd"}), use_container_width=True, height=320)
 
         cb = chargebacks.merge(fr[["month","fraud_rate_pct"]], on="month", how="left")
         st.plotly_chart(px.line(cb, x="month", y=["chargebacks","fraud_rate_pct"], title="Chargebacks and Fraud rate"), use_container_width=True)
@@ -424,7 +413,6 @@ with tab_finance:
             subs_f.groupby("month", as_index=False)["active"].sum(), on="month", how="left"
         )
         arpu["ARPU"] = arpu["mrr"] / arpu["active"].replace(0, np.nan)
-        arpu["CAC"] = CAC_PER_WIN
 
         act_by_month = subs_f.groupby("month", as_index=False)["active"].sum().rename(columns={"active":"active_accts"})
         act_by_month["churned"] = act_by_month["active_accts"].diff(-1) * -1
@@ -433,14 +421,14 @@ with tab_finance:
         mean_arpu = arpu["ARPU"].dropna().mean() if not arpu["ARPU"].dropna().empty else 0
         ltv = mean_arpu / (churn_rate/100) if churn_rate and churn_rate > 0 else np.nan
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Average ARPU", f"${mean_arpu:,.2f}")
-        c2.metric("Avg churn rate", f"{(churn_rate if churn_rate else 0):.2f}%")
-        c3.metric("LTV (simple)", f"${ltv:,.0f}" if np.isfinite(ltv) else "n/a")
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Average ARPU", f"${mean_arpu:,.2f}")
+        a2.metric("Avg churn rate", f"{(churn_rate if churn_rate else 0):.2f}%")
+        a3.metric("LTV (simple)", f"${ltv:,.0f}" if np.isfinite(ltv) else "n/a")
 
-        col1, col2 = st.columns(2)
-        col1.plotly_chart(px.line(arpu, x="month", y="ARPU", title="ARPU over time"), use_container_width=True)
-        col2.plotly_chart(px.line(act_by_month, x="month", y="churn_rate_pct", title="Churn rate over time"), use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(px.line(arpu, x="month", y="ARPU", title="ARPU over time"), use_container_width=True)
+        c2.plotly_chart(px.line(act_by_month, x="month", y="churn_rate_pct", title="Churn rate over time"), use_container_width=True)
     else:
         st.info("Not enough subscription data to compute ARPU/LTV.")
 
@@ -472,14 +460,14 @@ with tab_customer:
         coh = cohort_pivot[cohort_pivot["period_index"].between(0, 12)]
         heat = coh.pivot(index="cohort_month", columns="period_index", values="active").fillna(0)
 
-        col1, col2 = st.columns(2)
-        col1.plotly_chart(px.imshow(heat, aspect="auto", title="Retention Cohort (share active) 0-12 months", text_auto=".2f"), use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(px.imshow(heat, aspect="auto", title="Retention Cohort (share active) 0-12 months", text_auto=".2f"), use_container_width=True)
 
         seg = cust_f.groupby(["segment","plan"], as_index=False)["customer_id"].count().rename(columns={"customer_id":"count"}) if not cust_f.empty else pd.DataFrame(columns=["segment","plan","count"])
         if not seg.empty:
-            col2.plotly_chart(px.treemap(seg, path=["segment","plan"], values="count", title="Segment x Plan distribution"), use_container_width=True)
+            c2.plotly_chart(px.treemap(seg, path=["segment","plan"], values="count", title="Segment x Plan distribution"), use_container_width=True)
         else:
-            col2.info("No customers in current filter for segmentation view.")
+            c2.info("No customers in current filter for segmentation view.")
 
         if not txns_f.empty:
             topc = txns_f.groupby("customer_id", as_index=False)["net_revenue"].sum().sort_values("net_revenue", ascending=False).head(50)
@@ -502,7 +490,8 @@ with tab_board:
         growth = kpi_delta(rm, rp)
         act = subs[subs["month"] == last_month]["active"].sum()
         mrr_ = subs[subs["month"] == last_month]["mrr"].sum()
-        fraud_rate = (txns[txns["month"] == last_month]["fraud_loss"].sum() / txns[txns["month"] == last_month]["gross_revenue"].sum()) * 100 if txns[txns["month"] == last_month]["gross_revenue"].sum() else 0
+        gross_last = txns[txns["month"] == last_month]["gross_revenue"].sum()
+        fraud_rate = (txns[txns["month"] == last_month]["fraud_loss"].sum() / gross_last * 100) if gross_last else 0
     else:
         rm=rp=growth=act=mrr_=fraud_rate=0
 
